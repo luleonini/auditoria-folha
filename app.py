@@ -1,23 +1,51 @@
 import streamlit as st
 import pandas as pd
-import json
-import os
-from google import genai
-from google.genai import types
-from pydantic import BaseModel
+import re
+from pypdf import PdfReader
 
-st.set_page_config(page_title="Auditoria de Folha com IA", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="Auditoria de Folha de Pagamento", page_icon="📊", layout="wide")
 
-st.title("🤖 Auditoria Automática de Folha de Pagamento (com IA)")
-st.markdown("Auditoria inteligente: A IA lê **qualquer formato de holerite em PDF** e cruza os dados com o Excel.")
+st.title("📊 Auditoria Automática de Folha de Pagamento")
+st.markdown("Faça o upload dos **PDFs dos holerites** e da **planilha base Excel** para cruzar os valores e identificar divergências.")
 
-# Entrada da Chave de API do Gemini (Permite ao usuário colar sua API Key ou usar uma do ambiente)
-api_key = st.sidebar.text_input("Cole sua Gemini API Key:", type="password")
+# Expressões regulares aprimoradas para capturar Nome, Valor e Mês/Ano
+PATRAO_NOME = r"(?:Nome|Colaborador|Funcionário):\s*([A-Za-zÀ-ÿ\s]+)"
+PATRAO_VALOR = r"(?:Líquido|Total Líquido|Líquido a Receber|Valor Líquido):\s*R?\$\s*([\d\.\,]+)"
+PATRAO_MES = r"(?:Mês/Ano|Referência|Ref\.|Período):\s*(\d{2}/\d{4})"
 
-class DadosHolerite(BaseModel):
-    nome: str
-    valor_liquido: float
-    mes_referencia: str
+def extrair_dados_pdf(pdf_file):
+    reader = PdfReader(pdf_file)
+    texto = "".join([page.extract_text() or "" for page in reader.pages])
+    
+    # Busca via Regex
+    nome = re.search(PATRAO_NOME, texto, re.IGNORECASE)
+    valor = re.search(PATRAO_VALOR, texto, re.IGNORECASE)
+    mes = re.search(PATRAO_MES, texto, re.IGNORECASE)
+
+    # Fallback simples caso os rótulos exatos não sejam encontrados
+    if not mes:
+        mes_match = re.search(r"\b(\d{2}/\d{4})\b", texto)
+        mes_val = mes_match.group(1) if mes_match else "N/A"
+    else:
+        mes_val = mes.group(1)
+
+    nome_val = nome.group(1).strip() if nome else "NÃO IDENTIFICADO"
+    
+    val_clean = 0.0
+    if valor:
+        val_str = valor.group(1).replace(".", "").replace(",", ".")
+        try:
+            val_clean = float(val_str)
+        except ValueError:
+            val_clean = 0.0
+
+    return {
+        "nome_pdf": nome_val,
+        "nome_clean": nome_val.upper(),
+        "valor_pdf": val_clean,
+        "mes_ref": mes_val,
+        "chave_cruzamento": f"{nome_val.upper()}_{mes_val}"
+    }
 
 col1, col2 = st.columns(2)
 
@@ -27,117 +55,78 @@ with col1:
 with col2:
     uploaded_excel = st.file_uploader("2. Selecione a Planilha Base (.xlsx)", type=["xlsx"])
 
-if st.button("🚀 Processar Auditoria com IA", type="primary"):
-    if not api_key:
-        st.error("⚠️ Insira uma chave de API do Gemini na barra lateral para continuar.")
-    elif not uploaded_pdfs or not uploaded_excel:
-        st.error("⚠️ Envie os arquivos PDF e a planilha Excel antes de processar.")
+if st.button("🚀 Processar Auditoria", type="primary"):
+    if not uploaded_pdfs or not uploaded_excel:
+        st.error("⚠️ Por favor, envie tanto os arquivos PDF quanto a planilha Excel antes de processar.")
     else:
-        client = genai.Client(api_key=api_key)
-        dados_pdfs = []
+        # 1. Processar PDFs
+        dados_pdfs = [extrair_dados_pdf(pdf) for pdf in uploaded_pdfs]
+        df_pdf = pd.DataFrame(dados_pdfs)
 
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        for idx, pdf_file in enumerate(uploaded_pdfs):
-            status_text.text(f"Analizando com IA: {pdf_file.name}...")
-            pdf_bytes = pdf_file.read()
-
-            prompt = (
-                "Analise este holerite/folha de pagamento. Extraia o nome completo do colaborador, "
-                "o valor líquido a receber (como float numérico puro) e o mês de referência."
-            )
-
-            try:
-                response = client.models.generate_content(
-                    model='gemini-2.5-flash',
-                    contents=[
-                        types.Part.from_bytes(data=pdf_bytes, mime_type='application/pdf'),
-                        prompt
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=DadosHolerite,
-                        temperature=0.0
-                    )
-                )
-                
-                dados_json = json.loads(response.text)
-                dados_pdfs.append({
-                    "nome_clean": dados_json["nome"].strip().upper(),
-                    "nome_pdf": dados_json["nome"].strip(),
-                    "valor_pdf": float(dados_json["valor_liquido"]),
-                    "mes_ref": dados_json["mes_referencia"]
-                })
-            except Exception as e:
-                dados_pdfs.append({
-                    "nome_clean": pdf_file.name.upper(),
-                    "nome_pdf": f"Erro de Leitura ({pdf_file.name})",
-                    "valor_pdf": 0.0,
-                    "mes_ref": "N/A"
-                })
-            
-            progress_bar.progress((idx + 1) / len(uploaded_pdfs))
-
-        status_text.text("Concluindo cruzamento de dados...")
-
-        # Processar Excel
+        # 2. Processar Excel
         df_excel_raw = pd.read_excel(uploaded_excel)
         
-        # Identificação de colunas
-        col_nome = [c for c in df_excel_raw.columns if "nome" in str(c).lower() or "colaborador" in str(c).lower()][0]
-        col_valor = [c for c in df_excel_raw.columns if "valor" in str(c).lower() or "liquido" in str(c).lower() or "líquido" in str(c).lower()][0]
+        # Identificar colunas no Excel
+        col_nome = [c for c in df_excel_raw.columns if any(k in str(c).lower() for k in ["nome", "colaborador", "funcionario"])][0]
+        col_valor = [c for c in df_excel_raw.columns if any(k in str(c).lower() for k in ["valor", "liquido", "líquido", "total"])][0]
+        col_mes = [c for c in df_excel_raw.columns if any(k in str(c).lower() for k in ["mês", "mes", "referencia", "referência", "periodo"])][0]
 
         df_excel = df_excel_raw.copy()
         df_excel["nome_excel_orig"] = df_excel[col_nome]
+        df_excel["valor_excel_orig"] = pd.to_numeric(
+            df_excel[col_valor].astype(str).str.replace("R$", "", regex=False).str.replace(".", "", regex=False).str.replace(",", ".", regex=False).str.strip(),
+            errors="coerce"
+        ).fillna(0.0)
         
-        # Tratamento correto de valores monetários no Excel
-        def limpar_valor_excel(v):
-            if pd.isna(v): return 0.0
-            if isinstance(v, (int, float)): return float(v)
-            v_str = str(v).replace("R$", "").strip()
-            if "," in v_str and "." in v_str:
-                v_str = v_str.replace(".", "").replace(",", ".")
-            elif "," in v_str:
-                v_str = v_str.replace(",", ".")
-            return float(v_str)
+        df_excel["mes_excel"] = df_excel[col_mes].astype(str).str.strip()
+        df_excel["chave_cruzamento"] = df_excel[col_nome].astype(str).str.strip().str.upper() + "_" + df_excel["mes_excel"]
 
-        df_excel["valor_excel_orig"] = df_excel[col_valor].apply(limpar_valor_excel)
-        df_excel["nome_clean"] = df_excel[col_nome].astype(str).str.strip().str.upper()
-
-        # Cruzamento
-        df_final = pd.merge(pd.DataFrame(dados_pdfs), df_excel, on="nome_clean", how="outer")
+        # 3. Cruzamento por Chave Composta (Nome + Mês)
+        df_final = pd.merge(df_pdf, df_excel, on="chave_cruzamento", how="outer")
 
         def checar_status(row):
-            if pd.isna(row.get("nome_pdf")) or "Erro de Leitura" in str(row.get("nome_pdf")):
+            if pd.isna(row.get("nome_pdf")) or row.get("nome_pdf") == "NÃO IDENTIFICADO":
                 return "FALTANDO PDF"
             if pd.isna(row.get("nome_excel_orig")):
                 return "NÃO ENCONTRADO NO EXCEL"
             
             v_pdf = row.get("valor_pdf", 0.0)
             v_excel = row.get("valor_excel_orig", 0.0)
+            dif = abs(v_pdf - v_excel)
             
-            if abs(v_pdf - v_excel) > 0.01:
-                return f"DIVERGÊNCIA (PDF: R$ {v_pdf:,.2f} | EXCEL: R$ {v_excel:,.2f})"
+            if dif > 0.01:
+                return f"Divergência de Valor (Dif: R$ {dif:,.2f})"
             return "OK"
 
         df_final["Status_Auditoria"] = df_final.apply(checar_status, axis=1)
 
+        # Montar a tabela idêntica ao resumo
         df_exibicao = pd.DataFrame({
-            "Nome (PDF)": df_final["nome_pdf"].fillna("-"),
-            "Mês Ref.": df_final["mes_ref"].fillna("-"),
-            "Valor (PDF)": df_final["valor_pdf"].fillna(0.0),
-            "Nome (Excel)": df_final["nome_excel_orig"].fillna("-"),
-            "Valor (Excel)": df_final["valor_excel_orig"].fillna(0.0),
-            "Status da Auditoria": df_final["Status_Auditoria"]
+            "Mês Ref.": df_final["mes_ref"].fillna(df_final["mes_excel"]),
+            "Nome": df_final["nome_pdf"].fillna(df_final["nome_excel_orig"]),
+            "Valor (PDF)": df_final["valor_pdf"].map("R$ {:,.2f}".format),
+            "Valor (Excel)": df_final["valor_excel_orig"].map("R$ {:,.2f}".format),
+            "Status": df_final["Status_Auditoria"]
         })
 
-        st.success("✅ Auditoria realizada com sucesso via IA!")
+        st.success("✅ Auditoria realizada com sucesso!")
+        
+        # Métrica consolidada (como na Imagem 1)
+        total_regs = len(df_final)
+        conciliados = len(df_final[df_final["Status_Auditoria"] == "OK"])
+        inconsistentes = total_regs - conciliados
+
+        st.markdown(f"**Total de registros auditados:** {total_regs} colaboradores/períodos")
+        st.markdown(f"**Registros conciliados (OK):** {conciliados}")
+        st.markdown(f"**Inconsistências encontradas:** {inconsistentes}")
+
+        st.subheader("Resumo do Cruzamento:")
         st.dataframe(df_exibicao, use_container_width=True)
 
+        # Download em CSV
         csv_data = df_exibicao.to_csv(index=False, sep=";", encoding="utf-8-sig")
         st.download_button(
-            label="📥 Baixar Relatório de Divergências (.csv)",
+            label="📥 Baixar Relatório Completo (.csv)",
             data=csv_data,
             file_name="resultado_auditoria.csv",
             mime="text/csv"
