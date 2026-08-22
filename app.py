@@ -63,14 +63,13 @@ if st.button("🚀 Processar Auditoria", type="primary"):
     if not uploaded_pdfs or not uploaded_excel:
         st.error("⚠️ Por favor, envie tanto os arquivos PDF quanto a planilha Excel antes de processar.")
     else:
-        # 1. Processar PDFs
+        # 1. Leitura dos PDFs
         dados_pdfs = [extrair_dados_pdf(pdf) for pdf in uploaded_pdfs]
         df_pdf = pd.DataFrame(dados_pdfs)
 
-        # 2. Processar Excel
+        # 2. Leitura do Excel
         df_excel_raw = pd.read_excel(uploaded_excel)
         
-        # Busca dinâmica e segura das colunas
         col_nome = buscar_coluna_segura(df_excel_raw.columns, ["nome", "colaborador", "funcionario"])
         col_valor = buscar_coluna_segura(df_excel_raw.columns, ["valor", "liquido", "líquido", "total", "pago"])
         col_mes = buscar_coluna_segura(df_excel_raw.columns, ["mês", "mes", "referencia", "referência", "periodo", "data", "ano"])
@@ -91,54 +90,82 @@ if st.button("🚀 Processar Auditoria", type="primary"):
             df_excel["chave_cruzamento"] = df_excel[col_nome].astype(str).str.strip().str.upper() + "_" + df_excel["mes_excel"]
             modo_cruzamento = "chave_cruzamento"
         else:
-            # Caso o Excel não possua coluna de mês
             df_excel["nome_clean"] = df_excel[col_nome].astype(str).str.strip().str.upper()
             modo_cruzamento = "nome_clean"
 
         # 3. Cruzamento
         df_final = pd.merge(df_pdf, df_excel, on=modo_cruzamento, how="outer")
 
-        def checar_status(row):
+        # Tratamento de campos nulos após o merge
+        df_final["valor_pdf"] = df_final["valor_pdf"].fillna(0.0)
+        df_final["valor_excel_orig"] = df_final["valor_excel_orig"].fillna(0.0)
+        
+        if "mes_ref" in df_final.columns:
+            df_final["mes_ref"] = df_final["mes_ref"].fillna(df_final.get("mes_excel", "N/A"))
+        else:
+            df_final["mes_ref"] = df_final.get("mes_excel", "N/A")
+
+        df_final["nome_exibicao"] = df_final["nome_pdf"].fillna(df_final["nome_excel_orig"])
+
+        # Cálculo de divergências
+        df_final["diferenca"] = df_final["valor_pdf"] - df_final["valor_excel_orig"]
+        df_final["abs_dif"] = df_final["diferenca"].abs()
+
+        def definir_status(row):
             if pd.isna(row.get("nome_pdf")) or row.get("nome_pdf") == "NÃO IDENTIFICADO":
-                return "FALTANDO PDF"
+                return "Faltando PDF"
             if pd.isna(row.get("nome_excel_orig")):
-                return "NÃO ENCONTRADO NO EXCEL"
-            
-            v_pdf = row.get("valor_pdf", 0.0)
-            v_excel = row.get("valor_excel_orig", 0.0)
-            dif = abs(v_pdf - v_excel)
-            
-            if dif > 0.01:
-                return f"Divergência de Valor (Dif: R$ {dif:,.2f})"
+                return "Não encontrado no Excel"
+            if row["abs_dif"] > 0.01:
+                return "Divergência de Valor"
             return "OK"
 
-        df_final["Status_Auditoria"] = df_final.apply(checar_status, axis=1)
+        df_final["status"] = df_final.apply(definir_status, axis=1)
 
-        meses_exibicao = df_final["mes_ref"] if "mes_ref" in df_final.columns else df_final.get("mes_excel", "-")
-
-        df_exibicao = pd.DataFrame({
-            "Mês Ref.": meses_exibicao.fillna("-"),
-            "Nome": df_final["nome_pdf"].fillna(df_final["nome_excel_orig"]),
-            "Valor (PDF)": df_final["valor_pdf"].fillna(0.0).map("R$ {:,.2f}".format),
-            "Valor (Excel)": df_final["valor_excel_orig"].fillna(0.0).map("R$ {:,.2f}".format),
-            "Status": df_final["Status_Auditoria"]
-        })
-
-        st.success("✅ Auditoria realizada com sucesso!")
-        
-        # Indicadores
+        # Totais para os marcadores superiores
         total_regs = len(df_final)
-        conciliados = len(df_final[df_final["Status_Auditoria"] == "OK"])
-        inconsistentes = total_regs - conciliados
+        df_ok = df_final[df_final["status"] == "OK"]
+        df_inconsistentes = df_final[df_final["status"] != "OK"]
 
-        st.markdown(f"**Total de registros auditados:** {total_regs} colaboradores/períodos")
-        st.markdown(f"**Registros conciliados (OK):** {conciliados}")
-        st.markdown(f"**Inconsistências encontradas:** {inconsistentes}")
+        conciliados_count = len(df_ok)
+        inconsistentes_count = len(df_inconsistentes)
+
+        # Construção da lista de texto formatada exatamente como a imagem
+        st.markdown(f"* **Total de registros auditados:** {total_regs} colaboradores/períodos")
+        
+        if conciliados_count > 0:
+            refs_ok = ", ".join([f"Referência {m}" for m in df_ok["mes_ref"].unique()])
+            st.markdown(f"* **Registros conciliados (OK):** {conciliados_count} ({refs_ok})")
+        else:
+            st.markdown(f"* **Registros conciliados (OK):** 0")
+
+        if inconsistentes_count > 0:
+            refs_inc = ", ".join([f"Referência {row['mes_ref']} com {row['status'].lower()}" for _, row in df_inconsistentes.iterrows()])
+            st.markdown(f"* **Inconsistências encontradas:** {inconsistentes_count} ({refs_inc})")
+        else:
+            st.markdown(f"* **Inconsistências encontradas:** 0")
 
         st.subheader("Resumo do Cruzamento:")
-        st.dataframe(df_exibicao, use_container_width=True)
 
-        csv_data = df_exibicao.to_csv(index=False, sep=";", encoding="utf-8-sig")
+        # Formatação das linhas idêntica à imagem
+        for _, row in df_final.iterrows():
+            mes = row["mes_ref"]
+            nome = row["nome_exibicao"]
+            v_pdf = f"R$ {row['valor_pdf']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            v_excel = f"R$ {row['valor_excel_orig']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            dif_val = f"R$ {row['abs_dif']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            
+            if row["status"] == "OK":
+                status_txt = "*(OK)*"
+            else:
+                status_txt = f"*({row['status']})*"
+
+            st.markdown(
+                f"* **{mes}**: {nome} — PDF: **{v_pdf}** | Excel: **{v_excel}** | Diferença: **{dif_val}** {status_txt}"
+            )
+
+        # Botão de Download do CSV
+        csv_data = df_final.to_csv(index=False, sep=";", encoding="utf-8-sig")
         st.download_button(
             label="📥 Baixar Relatório Completo (.csv)",
             data=csv_data,
