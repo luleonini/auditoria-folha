@@ -8,7 +8,6 @@ st.set_page_config(page_title="Auditoria de Folha de Pagamento", page_icon="📊
 st.title("📊 Auditoria Automática de Folha de Pagamento")
 st.markdown("Faça o upload dos **PDFs dos holerites** e da **planilha base Excel** para cruzar os valores e identificar divergências.")
 
-# Expressões regulares aprimoradas para capturar Nome, Valor e Mês/Ano
 PATRAO_NOME = r"(?:Nome|Colaborador|Funcionário):\s*([A-Za-zÀ-ÿ\s]+)"
 PATRAO_VALOR = r"(?:Líquido|Total Líquido|Líquido a Receber|Valor Líquido):\s*R?\$\s*([\d\.\,]+)"
 PATRAO_MES = r"(?:Mês/Ano|Referência|Ref\.|Período):\s*(\d{2}/\d{4})"
@@ -17,12 +16,10 @@ def extrair_dados_pdf(pdf_file):
     reader = PdfReader(pdf_file)
     texto = "".join([page.extract_text() or "" for page in reader.pages])
     
-    # Busca via Regex
     nome = re.search(PATRAO_NOME, texto, re.IGNORECASE)
     valor = re.search(PATRAO_VALOR, texto, re.IGNORECASE)
     mes = re.search(PATRAO_MES, texto, re.IGNORECASE)
 
-    # Fallback simples caso os rótulos exatos não sejam encontrados
     if not mes:
         mes_match = re.search(r"\b(\d{2}/\d{4})\b", texto)
         mes_val = mes_match.group(1) if mes_match else "N/A"
@@ -47,6 +44,13 @@ def extrair_dados_pdf(pdf_file):
         "chave_cruzamento": f"{nome_val.upper()}_{mes_val}"
     }
 
+def buscar_coluna_segura(colunas, palavras_chave):
+    for col in colunas:
+        col_clean = str(col).strip().lower()
+        if any(keyword in col_clean for keyword in palavras_chave):
+            return col
+    return None
+
 col1, col2 = st.columns(2)
 
 with col1:
@@ -66,10 +70,14 @@ if st.button("🚀 Processar Auditoria", type="primary"):
         # 2. Processar Excel
         df_excel_raw = pd.read_excel(uploaded_excel)
         
-        # Identificar colunas no Excel
-        col_nome = [c for c in df_excel_raw.columns if any(k in str(c).lower() for k in ["nome", "colaborador", "funcionario"])][0]
-        col_valor = [c for c in df_excel_raw.columns if any(k in str(c).lower() for k in ["valor", "liquido", "líquido", "total"])][0]
-        col_mes = [c for c in df_excel_raw.columns if any(k in str(c).lower() for k in ["mês", "mes", "referencia", "referência", "periodo"])][0]
+        # Busca dinâmica e segura das colunas
+        col_nome = buscar_coluna_segura(df_excel_raw.columns, ["nome", "colaborador", "funcionario"])
+        col_valor = buscar_coluna_segura(df_excel_raw.columns, ["valor", "liquido", "líquido", "total", "pago"])
+        col_mes = buscar_coluna_segura(df_excel_raw.columns, ["mês", "mes", "referencia", "referência", "periodo", "data", "ano"])
+
+        if not col_nome or not col_valor:
+            st.error(f"❌ Não foi possível encontrar as colunas de Nome e Valor no Excel. Colunas encontradas: {list(df_excel_raw.columns)}")
+            st.stop()
 
         df_excel = df_excel_raw.copy()
         df_excel["nome_excel_orig"] = df_excel[col_nome]
@@ -78,11 +86,17 @@ if st.button("🚀 Processar Auditoria", type="primary"):
             errors="coerce"
         ).fillna(0.0)
         
-        df_excel["mes_excel"] = df_excel[col_mes].astype(str).str.strip()
-        df_excel["chave_cruzamento"] = df_excel[col_nome].astype(str).str.strip().str.upper() + "_" + df_excel["mes_excel"]
+        if col_mes:
+            df_excel["mes_excel"] = df_excel[col_mes].astype(str).str.strip()
+            df_excel["chave_cruzamento"] = df_excel[col_nome].astype(str).str.strip().str.upper() + "_" + df_excel["mes_excel"]
+            modo_cruzamento = "chave_cruzamento"
+        else:
+            # Caso o Excel não possua coluna de mês
+            df_excel["nome_clean"] = df_excel[col_nome].astype(str).str.strip().str.upper()
+            modo_cruzamento = "nome_clean"
 
-        # 3. Cruzamento por Chave Composta (Nome + Mês)
-        df_final = pd.merge(df_pdf, df_excel, on="chave_cruzamento", how="outer")
+        # 3. Cruzamento
+        df_final = pd.merge(df_pdf, df_excel, on=modo_cruzamento, how="outer")
 
         def checar_status(row):
             if pd.isna(row.get("nome_pdf")) or row.get("nome_pdf") == "NÃO IDENTIFICADO":
@@ -100,18 +114,19 @@ if st.button("🚀 Processar Auditoria", type="primary"):
 
         df_final["Status_Auditoria"] = df_final.apply(checar_status, axis=1)
 
-        # Montar a tabela idêntica ao resumo
+        meses_exibicao = df_final["mes_ref"] if "mes_ref" in df_final.columns else df_final.get("mes_excel", "-")
+
         df_exibicao = pd.DataFrame({
-            "Mês Ref.": df_final["mes_ref"].fillna(df_final["mes_excel"]),
+            "Mês Ref.": meses_exibicao.fillna("-"),
             "Nome": df_final["nome_pdf"].fillna(df_final["nome_excel_orig"]),
-            "Valor (PDF)": df_final["valor_pdf"].map("R$ {:,.2f}".format),
-            "Valor (Excel)": df_final["valor_excel_orig"].map("R$ {:,.2f}".format),
+            "Valor (PDF)": df_final["valor_pdf"].fillna(0.0).map("R$ {:,.2f}".format),
+            "Valor (Excel)": df_final["valor_excel_orig"].fillna(0.0).map("R$ {:,.2f}".format),
             "Status": df_final["Status_Auditoria"]
         })
 
         st.success("✅ Auditoria realizada com sucesso!")
         
-        # Métrica consolidada (como na Imagem 1)
+        # Indicadores
         total_regs = len(df_final)
         conciliados = len(df_final[df_final["Status_Auditoria"] == "OK"])
         inconsistentes = total_regs - conciliados
@@ -123,7 +138,6 @@ if st.button("🚀 Processar Auditoria", type="primary"):
         st.subheader("Resumo do Cruzamento:")
         st.dataframe(df_exibicao, use_container_width=True)
 
-        # Download em CSV
         csv_data = df_exibicao.to_csv(index=False, sep=";", encoding="utf-8-sig")
         st.download_button(
             label="📥 Baixar Relatório Completo (.csv)",
