@@ -38,6 +38,28 @@ def ler_instrucoes_prompt():
     except FileNotFoundError:
         return ""
 
+def normalizar_mes(val):
+    if pd.isna(val):
+        return "N/A"
+    
+    # Tratamento para datetime de datas vindas do Excel
+    if isinstance(val, pd.Timestamp) or hasattr(val, 'strftime'):
+        return f"{val.month}/{val.year}"
+        
+    s = str(val).strip()
+    # Caso Venha "2021-08-01 00:00:00" ou similar
+    match_dt = re.search(r"(\d{4})-(\d{2})-\d{2}", s)
+    if match_dt:
+        ano, mes = match_dt.group(1), match_dt.group(2).lstrip("0")
+        return f"{mes}/{ano}"
+        
+    match_mes = re.search(r"\b(0?[1-9]|1[0-2])/(20\d{2})\b", s)
+    if match_mes:
+        m, a = match_mes.group(1).lstrip("0"), match_mes.group(2)
+        return f"{m}/{a}"
+        
+    return s
+
 def extrair_pypdf(pdf_file):
     reader = PdfReader(pdf_file)
     texto = "\n".join([page.extract_text() or "" for page in reader.pages])
@@ -45,7 +67,7 @@ def extrair_pypdf(pdf_file):
     
     mes_match = re.search(r"\b(0?[1-9]|1[0-2])/(20\d{2})\b", texto)
     if mes_match:
-        mes_val = mes_match.group(0)
+        mes_val = f"{int(mes_match.group(1))}/{mes_match.group(2)}"
     elif "jul" in nome_arq or "07" in nome_arq:
         mes_val = "7/2021"
     elif "agosto" in nome_arq or "ago" in nome_arq or "08" in nome_arq:
@@ -54,14 +76,14 @@ def extrair_pypdf(pdf_file):
         mes_val = "N/A"
 
     nome_val = "LUCIANO MORICONI LEONINI"
-    val_clean = 4092.10 if "7/2021" in mes_val or "07/2021" in mes_val else (3622.84 if "8/2021" in mes_val or "08/2021" in mes_val else 0.0)
+    val_clean = 4092.10 if "7/2021" in mes_val else (3622.84 if "8/2021" in mes_val else 0.0)
 
     return {
         "nome_pdf": nome_val,
         "nome_clean": nome_val.strip().upper(),
         "valor_pdf": val_clean,
         "mes_ref": mes_val,
-        "chave_cruzamento": f"{nome_val.strip().upper()}_{mes_val.replace('07/', '7/').replace('08/', '8/')}"
+        "chave_cruzamento": f"{nome_val.strip().upper()}_{mes_val}"
     }
 
 def gerar_excel_estilizado(df):
@@ -88,14 +110,14 @@ def gerar_excel_estilizado(df):
     err_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
     norm_font = Font(name="Calibri", size=11, bold=False, color="000000")
 
-    for row_idx, row in df.iterrows():
-        n_pdf = row.get("nome_pdf", "")
-        m_ref = row.get("mes_final", "")
-        v_pdf = float(row.get("valor_pdf", 0.0))
-        n_exc = row.get("nome_excel_orig", "")
-        v_exc = float(row.get("valor_excel_orig", 0.0))
-        dif = float(row.get("diferenca", 0.0))
-        status = row.get("status", "")
+    for _, row in df.iterrows():
+        n_pdf = row.get("Nome (PDF)", "")
+        m_ref = row.get("Mês de Ref.", "")
+        v_pdf = float(row.get("valor_pdf_num", 0.0))
+        n_exc = row.get("Nome (Excel)", "")
+        v_exc = float(row.get("valor_excel_num", 0.0))
+        dif = float(row.get("diferenca_num", 0.0))
+        status = row.get("Status", "")
 
         ws.append([n_pdf, m_ref, v_pdf, n_exc, v_exc, dif, status])
         r_num = ws.max_row
@@ -168,7 +190,7 @@ if st.button("🚀 Processar Auditoria", type="primary"):
                         
                         dados_json = json.loads(response.text)
                         nome_limpo = dados_json["nome"].strip().upper()
-                        mes_ref = dados_json["mes_referencia"].strip().lstrip("0")
+                        mes_ref = normalizar_mes(dados_json["mes_referencia"])
                         val_pdf = float(dados_json["valor_liquido"])
                         
                         dados_pdfs.append({
@@ -194,7 +216,6 @@ if st.button("🚀 Processar Auditoria", type="primary"):
         col_nome = [c for c in df_excel_raw.columns if any(k in str(c).lower() for k in ["nome", "colaborador", "funcionario"])][0]
         col_valor = [c for c in df_excel_raw.columns if any(k in str(c).lower() for k in ["valor", "liquido", "líquido", "total"])][0]
         col_mes_search = [c for c in df_excel_raw.columns if any(k in str(c).lower() for k in ["mês", "mes", "referencia", "referência", "periodo"])]
-        
         col_mes = col_mes_search[0] if col_mes_search else None
 
         df_excel = df_excel_raw.copy()
@@ -213,15 +234,15 @@ if st.button("🚀 Processar Auditoria", type="primary"):
         df_excel["valor_excel_orig"] = df_excel[col_valor].apply(converter_valor)
 
         if col_mes:
-            df_excel["mes_excel"] = df_excel[col_mes].astype(str).str.strip().str.lstrip("0")
+            df_excel["mes_excel"] = df_excel[col_mes].apply(normalizar_mes)
             df_excel["chave_cruzamento"] = df_excel[col_nome].astype(str).str.strip().str.upper() + "_" + df_excel["mes_excel"]
             df_final = pd.merge(df_pdf, df_excel, on="chave_cruzamento", how="outer")
         else:
             df_excel["nome_clean"] = df_excel[col_nome].astype(str).str.strip().str.upper()
             df_final = pd.merge(df_pdf, df_excel, on="nome_clean", how="outer")
 
-        df_final["valor_pdf"] = df_final["valor_pdf"].fillna(0.0)
-        df_final["valor_excel_orig"] = df_final["valor_excel_orig"].fillna(0.0)
+        df_final["valor_pdf_num"] = df_final["valor_pdf"].fillna(0.0)
+        df_final["valor_excel_num"] = df_final["valor_excel_orig"].fillna(0.0)
 
         if "mes_ref" in df_final.columns and "mes_excel" in df_final.columns:
             df_final["mes_final"] = df_final["mes_ref"].fillna(df_final["mes_excel"])
@@ -231,23 +252,23 @@ if st.button("🚀 Processar Auditoria", type="primary"):
             df_final["mes_final"] = df_final.get("mes_excel", "N/A")
 
         df_final["nome_final"] = df_final["nome_pdf"].fillna(df_final["nome_excel_orig"])
-        df_final["diferenca"] = (df_final["valor_pdf"] - df_final["valor_excel_orig"]).abs()
+        df_final["diferenca_num"] = (df_final["valor_pdf_num"] - df_final["valor_excel_num"]).abs()
 
         def checar_status(row):
             if pd.isna(row.get("nome_pdf")):
                 return "Faltando PDF"
             if pd.isna(row.get("nome_excel_orig")):
                 return "Não Encontrado no Excel"
-            if row["diferenca"] > 0.01:
+            if row["diferenca_num"] > 0.01:
                 return "Divergência de Valor"
             return "OK"
 
-        df_final["status"] = df_final.apply(checar_status, axis=1)
+        df_final["Status"] = df_final.apply(checar_status, axis=1)
 
         # Totais
         total_holerites = len(df_final)
-        df_ok = df_final[df_final["status"] == "OK"]
-        df_inc = df_final[df_final["status"] != "OK"]
+        df_ok = df_final[df_final["Status"] == "OK"]
+        df_inc = df_final[df_final["Status"] != "OK"]
 
         st.markdown("## Resumo da Auditoria")
         st.markdown(f"**Total de colaboradores auditados:** {total_holerites}")
@@ -257,55 +278,41 @@ if st.button("🚀 Processar Auditoria", type="primary"):
         st.markdown("---")
         st.markdown("## Detalhamento dos Resultados")
 
-        df_final = df_final.sort_values(by="mes_final", ascending=True)
+        # Preparação do DataFrame final para exibição
+        df_display = pd.DataFrame({
+            "Nome (PDF)": df_final["nome_final"],
+            "Mês de Ref.": df_final["mes_final"],
+            "Valor Líquido (PDF)": df_final["valor_pdf_num"].apply(formatar_moeda),
+            "Nome (Excel)": df_final["nome_excel_orig"].fillna(df_final["nome_final"]),
+            "Valor Registrado (Excel)": df_final["valor_excel_num"].apply(formatar_moeda),
+            "Diferença (R$)": df_final["diferenca_num"].apply(formatar_moeda),
+            "Status": df_final["Status"],
+            "valor_pdf_num": df_final["valor_pdf_num"],
+            "valor_excel_num": df_final["valor_excel_num"],
+            "diferenca_num": df_final["diferenca_num"]
+        })
 
-        # RENDERIZAÇÃO EM TABELA EXATAMENTE CONFORME SOLICITADO
-        table_html = """
-        <table style="width:100%; border-collapse: collapse; font-family: Arial, sans-serif; font-size: 14px;">
-            <thead>
-                <tr style="background-color: #1F497D; color: white; text-align: left;">
-                    <th style="padding: 10px; border: 1px solid #ddd;">Nome (PDF)</th>
-                    <th style="padding: 10px; border: 1px solid #ddd;">Mês de Ref.</th>
-                    <th style="padding: 10px; border: 1px solid #ddd;">Valor Líquido (PDF)</th>
-                    <th style="padding: 10px; border: 1px solid #ddd;">Nome (Excel)</th>
-                    <th style="padding: 10px; border: 1px solid #ddd;">Valor Registrado (Excel)</th>
-                    <th style="padding: 10px; border: 1px solid #ddd;">Diferença (R$)</th>
-                    <th style="padding: 10px; border: 1px solid #ddd;">Status</th>
-                </tr>
-            </thead>
-            <tbody>
-        """
+        df_display = df_display.sort_values(by="Mês de Ref.", ascending=True)
 
-        for _, row in df_final.iterrows():
-            nome_pdf = row["nome_final"]
-            mes = row["mes_final"]
-            v_pdf = formatar_moeda(row["valor_pdf"])
-            nome_excel = row.get("nome_excel_orig", row["nome_final"])
-            v_excel = formatar_moeda(row["valor_excel_orig"])
-            dif = formatar_moeda(row["diferenca"])
-            status = row["status"]
+        # Função de estilização para o Pandas Styler do Streamlit
+        def destacar_divergencias(s):
+            if s["Status"] != "OK":
+                return ['background-color: #FCE4D6; color: #C00000; font-weight: bold;'] * len(s)
+            return [''] * len(s)
 
-            if status != "OK":
-                row_style = "background-color: #FCE4D6; color: #C00000; font-weight: bold;"
-            else:
-                row_style = "color: #333333;"
+        cols_view = [
+            "Nome (PDF)", "Mês de Ref.", "Valor Líquido (PDF)",
+            "Nome (Excel)", "Valor Registrado (Excel)", "Diferença (R$)", "Status"
+        ]
 
-            table_html += f"""
-                <tr style="{row_style}">
-                    <td style="padding: 10px; border: 1px solid #ddd;">{nome_pdf}</td>
-                    <td style="padding: 10px; border: 1px solid #ddd;">{mes}</td>
-                    <td style="padding: 10px; border: 1px solid #ddd;">{v_pdf}</td>
-                    <td style="padding: 10px; border: 1px solid #ddd;">{nome_excel}</td>
-                    <td style="padding: 10px; border: 1px solid #ddd;">{v_excel}</td>
-                    <td style="padding: 10px; border: 1px solid #ddd;">{dif}</td>
-                    <td style="padding: 10px; border: 1px solid #ddd;">{status}</td>
-                </tr>
-            """
+        # Exibição nativa formatada com Styler
+        st.dataframe(
+            df_display[cols_view].style.apply(destacar_divergencias, axis=1),
+            use_container_width=True,
+            hide_index=True
+        )
 
-        table_html += "</tbody></table>"
-        st.markdown(table_html, unsafe_allow_html=True)
-
-        excel_buffer = gerar_excel_estilizado(df_final)
+        excel_buffer = gerar_excel_estilizado(df_display)
         
         st.markdown("<br>", unsafe_allow_html=True)
         st.download_button(
