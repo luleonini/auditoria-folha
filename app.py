@@ -1,323 +1,109 @@
+import io
 import streamlit as st
 import pandas as pd
-import json
-import os
-import io
-import re
-from pypdf import PdfReader
+import openpyxl
+from openpyxl.styles import Font, PatternFill
 from google import genai
 from google.genai import types
-from pydantic import BaseModel
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment
-from openpyxl.utils import get_column_letter
 
-st.set_page_config(page_title="Auditoria de Folha de Pagamento", page_icon="📊", layout="wide")
+# Configuração da página
+st.set_page_config(
+    page_title="Auditoria de Folha de Pagamento",
+    page_icon="🔍",
+    layout="wide"
+)
 
-st.title("📊 Auditoria Automática de Folha de Pagamento")
-st.markdown("Faça o upload dos **PDFs dos holerites** e da **planilha base Excel** para cruzar os valores e identificar divergências.")
+# Estilização visual (Status de Auditoria)
+def destacar_divergencias(val):
+    if val != "OK":
+        return 'background-color: #FCE4D6; color: #C00000; font-weight: bold;'
+    return ''
 
-# Recuperação da chave de API
-api_key_secret = st.secrets.get("GEMINI_API_KEY", "") if "GEMINI_API_KEY" in st.secrets else os.environ.get("GEMINI_API_KEY", "")
+# Interface Sidebar - Privacidade & Configuração
+st.sidebar.title("🔒 Segurança & Configuração")
+st.sidebar.info(
+    "**Conformidade com a LGPD:**\n"
+    "Esta aplicação processa os arquivos exclusivamente em memória RAM. "
+    "Nenhum dado financeiro ou pessoal é armazenado no servidor."
+)
 
-st.sidebar.header("Configurações")
-api_key_input = st.sidebar.text_input("Gemini API Key (Opcional):", value=api_key_secret, type="password")
+# Gerenciamento da Chave de API
+api_key = st.sidebar.text_input("Gemini API Key", type="password", help="Chave corporativa da Gemini API")
+if not api_key:
+    if "GEMINI_API_KEY" in st.secrets:
+        api_key = st.secrets["GEMINI_API_KEY"]
 
-class DadosHolerite(BaseModel):
-    nome: str
-    valor_liquido: float
-    mes_referencia: str
+# Botão de Limpeza Manual de Dados
+if st.sidebar.button("🧹 Limpar Dados em Memória"):
+    st.session_state.clear()
+    st.rerun()
 
-def formatar_moeda(valor):
-    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+st.title("🔍 Auditoria Automática de Folha de Pagamento")
+st.markdown("Suba a planilha base em Excel e os PDFs dos holerites para realizar a conciliação automática.")
 
-def ler_instrucoes_prompt():
-    try:
-        with open("prompt.txt", "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return ""
-
-def normalizar_mes(val):
-    if pd.isna(val):
-        return "N/A"
-    
-    # Tratamento para datetime de datas vindas do Excel
-    if isinstance(val, pd.Timestamp) or hasattr(val, 'strftime'):
-        return f"{val.month}/{val.year}"
-        
-    s = str(val).strip()
-    # Caso Venha "2021-08-01 00:00:00" ou similar
-    match_dt = re.search(r"(\d{4})-(\d{2})-\d{2}", s)
-    if match_dt:
-        ano, mes = match_dt.group(1), match_dt.group(2).lstrip("0")
-        return f"{mes}/{ano}"
-        
-    match_mes = re.search(r"\b(0?[1-9]|1[0-2])/(20\d{2})\b", s)
-    if match_mes:
-        m, a = match_mes.group(1).lstrip("0"), match_mes.group(2)
-        return f"{m}/{a}"
-        
-    return s
-
-def extrair_pypdf(pdf_file):
-    reader = PdfReader(pdf_file)
-    texto = "\n".join([page.extract_text() or "" for page in reader.pages])
-    nome_arq = pdf_file.name.lower()
-    
-    mes_match = re.search(r"\b(0?[1-9]|1[0-2])/(20\d{2})\b", texto)
-    if mes_match:
-        mes_val = f"{int(mes_match.group(1))}/{mes_match.group(2)}"
-    elif "jul" in nome_arq or "07" in nome_arq:
-        mes_val = "7/2021"
-    elif "agosto" in nome_arq or "ago" in nome_arq or "08" in nome_arq:
-        mes_val = "8/2021"
-    else:
-        mes_val = "N/A"
-
-    nome_val = "LUCIANO MORICONI LEONINI"
-    val_clean = 4092.10 if "7/2021" in mes_val else (3622.84 if "8/2021" in mes_val else 0.0)
-
-    return {
-        "nome_pdf": nome_val,
-        "nome_clean": nome_val.strip().upper(),
-        "valor_pdf": val_clean,
-        "mes_ref": mes_val,
-        "chave_cruzamento": f"{nome_val.strip().upper()}_{mes_val}"
-    }
-
-def gerar_excel_estilizado(df):
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Auditoria"
-
-    headers = [
-        "Nome (PDF)", "Mês de Ref.", "Valor Líquido (PDF)",
-        "Nome (Excel)", "Valor Registrado (Excel)", "Diferença (R$)", "Status"
-    ]
-    ws.append(headers)
-
-    header_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
-    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    
-    for col_num, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col_num)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    err_font = Font(name="Calibri", size=11, bold=True, color="C00000")
-    err_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
-    norm_font = Font(name="Calibri", size=11, bold=False, color="000000")
-
-    for _, row in df.iterrows():
-        n_pdf = row.get("Nome (PDF)", "")
-        m_ref = row.get("Mês de Ref.", "")
-        v_pdf = float(row.get("valor_pdf_num", 0.0))
-        n_exc = row.get("Nome (Excel)", "")
-        v_exc = float(row.get("valor_excel_num", 0.0))
-        dif = float(row.get("diferenca_num", 0.0))
-        status = row.get("Status", "")
-
-        ws.append([n_pdf, m_ref, v_pdf, n_exc, v_exc, dif, status])
-        r_num = ws.max_row
-
-        is_divergente = status != "OK"
-
-        for c_num in range(1, 8):
-            cell = ws.cell(row=r_num, column=c_num)
-            if c_num in [3, 5, 6]:
-                cell.number_format = 'R$ #,##0.00'
-
-            if is_divergente:
-                cell.font = err_font
-                cell.fill = err_fill
-            else:
-                cell.font = norm_font
-
-    for col in ws.columns:
-        max_len = max(len(str(cell.value or '')) for cell in col)
-        col_letter = get_column_letter(col[0].column)
-        ws.column_dimensions[col_letter].width = max(max_len + 4, 15)
-
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
-    return buffer
-
+# Carregamento de Arquivos em Memória
 col1, col2 = st.columns(2)
-
 with col1:
-    uploaded_pdfs = st.file_uploader("1. Selecione os PDFs dos Holerites", type=["pdf"], accept_multiple_files=True)
-
+    excel_file = st.file_uploader("1. Planilha Base (Excel)", type=["xlsx", "xls"])
 with col2:
-    uploaded_excel = st.file_uploader("2. Selecione a Planilha Base (.xlsx)", type=["xlsx"])
+    pdf_files = st.file_uploader("2. Holerites / Folha (PDFs)", type=["pdf"], accept_multiple_files=True)
 
+# Leitura do Prompt de Instrução
+try:
+    with open("prompt.txt", "r", encoding="utf-8") as f:
+        prompt_instrucoes = f.read()
+except FileNotFoundError:
+    st.error("Erro: Arquivo 'prompt.txt' não encontrado na raiz da aplicação.")
+    st.stop()
+
+# Processamento da Auditoria
 if st.button("🚀 Processar Auditoria", type="primary"):
-    if not uploaded_pdfs or not uploaded_excel:
-        st.error("⚠️ Envie os arquivos PDF e a planilha Excel antes de processar.")
-    else:
-        prompt_texto = ler_instrucoes_prompt()
-        final_key = api_key_input.strip()
-        dados_pdfs = []
-        usou_ai = False
+    if not api_key:
+        st.error("Por favor, informe a chave da Gemini API na barra lateral ou configure nos Secrets.")
+        st.stop()
+    if not excel_file or not pdf_files:
+        st.warning("É necessário carregar a planilha Excel e pelo menos um arquivo PDF.")
+        st.stop()
 
-        if final_key:
-            try:
-                client = genai.Client(api_key=final_key)
-                with st.spinner("🤖 Executando o agente de IA conforme instruído no prompt.txt..."):
-                    for pdf_file in uploaded_pdfs:
-                        pdf_bytes = pdf_file.read()
-                        
-                        prompt_exec = (
-                            f"{prompt_texto}\n\n"
-                            "Extraia o nome completo do colaborador, o valor líquido numérico "
-                            "e o mês de referência (MM/AAAA) do PDF em anexo."
-                        )
+    with st.spinner("Processando arquivos exclusivamente em memória..."):
+        try:
+            # Inicializa Cliente Gemini
+            client = genai.Client(api_key=api_key)
 
-                        response = client.models.generate_content(
-                            model='gemini-2.5-flash',
-                            contents=[
-                                types.Part.from_bytes(data=pdf_bytes, mime_type='application/pdf'),
-                                prompt_exec
-                            ],
-                            config=types.GenerateContentConfig(
-                                response_mime_type="application/json",
-                                response_schema=DadosHolerite,
-                                temperature=0.0
-                            )
-                        )
-                        
-                        dados_json = json.loads(response.text)
-                        nome_limpo = dados_json["nome"].strip().upper()
-                        mes_ref = normalizar_mes(dados_json["mes_referencia"])
-                        val_pdf = float(dados_json["valor_liquido"])
-                        
-                        dados_pdfs.append({
-                            "nome_pdf": dados_json["nome"].strip(),
-                            "nome_clean": nome_limpo,
-                            "valor_pdf": val_pdf,
-                            "mes_ref": mes_ref,
-                            "chave_cruzamento": f"{nome_limpo}_{mes_ref}"
-                        })
-                usou_ai = True
-            except Exception:
-                dados_pdfs = []
+            # Prepara os arquivos diretamente em memória para envio à API
+            contents = [prompt_instrucoes]
+            
+            # Adiciona a planilha Excel (lida como bytes)
+            contents.append(
+                types.Part.from_bytes(
+                    data=excel_file.getvalue(),
+                    mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            )
 
-        if not usou_ai or not dados_pdfs:
-            for pdf_file in uploaded_pdfs:
-                dados_pdfs.append(extrair_pypdf(pdf_file))
+            # Adiciona os PDFs (lidos como bytes)
+            for pdf in pdf_files:
+                contents.append(
+                    types.Part.from_bytes(
+                        data=pdf.getvalue(),
+                        mime_type="application/pdf"
+                    )
+                )
 
-        df_pdf = pd.DataFrame(dados_pdfs)
+            # Chamada ao Modelo Gemini 2.5 Flash
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents
+            )
 
-        # Leitura da planilha Excel
-        df_excel_raw = pd.read_excel(uploaded_excel)
-        
-        col_nome = [c for c in df_excel_raw.columns if any(k in str(c).lower() for k in ["nome", "colaborador", "funcionario"])][0]
-        col_valor = [c for c in df_excel_raw.columns if any(k in str(c).lower() for k in ["valor", "liquido", "líquido", "total"])][0]
-        col_mes_search = [c for c in df_excel_raw.columns if any(k in str(c).lower() for k in ["mês", "mes", "referencia", "referência", "periodo"])]
-        col_mes = col_mes_search[0] if col_mes_search else None
+            # Salva o resultado do texto na sessão
+            st.session_state["resultado_ia"] = response.text
+            st.success("Auditoria concluída com sucesso!")
 
-        df_excel = df_excel_raw.copy()
-        df_excel["nome_excel_orig"] = df_excel[col_nome]
+        except Exception as e:
+            st.error(f"Erro durante o processamento: {str(e)}")
 
-        def converter_valor(val):
-            if pd.isna(val): return 0.0
-            if isinstance(val, (int, float)): return float(val)
-            v_str = str(val).replace("R$", "").strip()
-            if "," in v_str and "." in v_str:
-                v_str = v_str.replace(".", "").replace(",", ".")
-            elif "," in v_str:
-                v_str = v_str.replace(",", ".")
-            return float(v_str)
-
-        df_excel["valor_excel_orig"] = df_excel[col_valor].apply(converter_valor)
-
-        if col_mes:
-            df_excel["mes_excel"] = df_excel[col_mes].apply(normalizar_mes)
-            df_excel["chave_cruzamento"] = df_excel[col_nome].astype(str).str.strip().str.upper() + "_" + df_excel["mes_excel"]
-            df_final = pd.merge(df_pdf, df_excel, on="chave_cruzamento", how="outer")
-        else:
-            df_excel["nome_clean"] = df_excel[col_nome].astype(str).str.strip().str.upper()
-            df_final = pd.merge(df_pdf, df_excel, on="nome_clean", how="outer")
-
-        df_final["valor_pdf_num"] = df_final["valor_pdf"].fillna(0.0)
-        df_final["valor_excel_num"] = df_final["valor_excel_orig"].fillna(0.0)
-
-        if "mes_ref" in df_final.columns and "mes_excel" in df_final.columns:
-            df_final["mes_final"] = df_final["mes_ref"].fillna(df_final["mes_excel"])
-        elif "mes_ref" in df_final.columns:
-            df_final["mes_final"] = df_final["mes_ref"]
-        else:
-            df_final["mes_final"] = df_final.get("mes_excel", "N/A")
-
-        df_final["nome_final"] = df_final["nome_pdf"].fillna(df_final["nome_excel_orig"])
-        df_final["diferenca_num"] = (df_final["valor_pdf_num"] - df_final["valor_excel_num"]).abs()
-
-        def checar_status(row):
-            if pd.isna(row.get("nome_pdf")):
-                return "Faltando PDF"
-            if pd.isna(row.get("nome_excel_orig")):
-                return "Não Encontrado no Excel"
-            if row["diferenca_num"] > 0.01:
-                return "Divergência de Valor"
-            return "OK"
-
-        df_final["Status"] = df_final.apply(checar_status, axis=1)
-
-        # Totais
-        total_holerites = len(df_final)
-        df_ok = df_final[df_final["Status"] == "OK"]
-        df_inc = df_final[df_final["Status"] != "OK"]
-
-        st.markdown("## Resumo da Auditoria")
-        st.markdown(f"**Total de colaboradores auditados:** {total_holerites}")
-        st.markdown(f"**Registros conciliados (OK):** {len(df_ok)}")
-        st.markdown(f"**Quantidade de inconsistências encontradas:** {len(df_inc)}")
-
-        st.markdown("---")
-        st.markdown("## Detalhamento dos Resultados")
-
-        # Preparação do DataFrame final para exibição
-        df_display = pd.DataFrame({
-            "Nome (PDF)": df_final["nome_final"],
-            "Mês de Ref.": df_final["mes_final"],
-            "Valor Líquido (PDF)": df_final["valor_pdf_num"].apply(formatar_moeda),
-            "Nome (Excel)": df_final["nome_excel_orig"].fillna(df_final["nome_final"]),
-            "Valor Registrado (Excel)": df_final["valor_excel_num"].apply(formatar_moeda),
-            "Diferença (R$)": df_final["diferenca_num"].apply(formatar_moeda),
-            "Status": df_final["Status"],
-            "valor_pdf_num": df_final["valor_pdf_num"],
-            "valor_excel_num": df_final["valor_excel_num"],
-            "diferenca_num": df_final["diferenca_num"]
-        })
-
-        df_display = df_display.sort_values(by="Mês de Ref.", ascending=True)
-
-        # Função de estilização para o Pandas Styler do Streamlit
-        def destacar_divergencias(s):
-            if s["Status"] != "OK":
-                return ['background-color: #FCE4D6; color: #C00000; font-weight: bold;'] * len(s)
-            return [''] * len(s)
-
-        cols_view = [
-            "Nome (PDF)", "Mês de Ref.", "Valor Líquido (PDF)",
-            "Nome (Excel)", "Valor Registrado (Excel)", "Diferença (R$)", "Status"
-        ]
-
-        # Exibição nativa formatada com Styler
-        st.dataframe(
-            df_display[cols_view].style.apply(destacar_divergencias, axis=1),
-            use_container_width=True,
-            hide_index=True
-        )
-
-        excel_buffer = gerar_excel_estilizado(df_display)
-        
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.download_button(
-            label="📥 Baixar relatorio_divergencias.xlsx Estilizado",
-            data=excel_buffer,
-            file_name="relatorio_divergencias.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+# Exibição dos Resultados (se existirem na sessão)
+if "resultado_ia" in st.session_state:
+    st.markdown("### 📊 Relatório Sintético da Auditoria")
+    st.markdown(st.session_state["resultado_ia"])
