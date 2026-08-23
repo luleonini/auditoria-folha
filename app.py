@@ -90,9 +90,9 @@ if st.button("🚀 Processar Auditoria", type="primary"):
                     )
                 )
 
-            # Chamada ao Modelo Gemini 2.5 Flash
+            # Chamada ao Modelo Gemini 3.6 Flash
             response = client.models.generate_content(
-                model="gemini-2.5-flash", 
+                model="gemini-3.6-flash", 
                 contents=contents
             )
 
